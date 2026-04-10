@@ -150,27 +150,39 @@ proc sampleTex*(tex: Texture; u, v: float32): uint32 =
 proc sampleTexBilinear*(tex: Texture; u, v: float32): uint32 =
   # Bilinear filter with power-of-2 repeat wrap.
   # Offset by 0.5 so the sample point aligns with the texel centre.
-  let fx = u * float32(tex.w) - 0.5'f32
-  let fy = v * float32(tex.h) - 0.5'f32
-  let ix = int(floor(fx))
-  let iy = int(floor(fy))
-  let sx = fx - float32(ix)   # horizontal blend weight [0, 1)
-  let sy = fy - float32(iy)   # vertical   blend weight [0, 1)
-  let x0 = ix       and (tex.w - 1)
-  let x1 = (ix + 1) and (tex.w - 1)
-  let y0 = iy       and (tex.h - 1)
-  let y1 = (iy + 1) and (tex.h - 1)
+  let fx  = u * float32(tex.w) - 0.5'f32
+  let fy  = v * float32(tex.h) - 0.5'f32
+  let ix  = int(floor(fx))
+  let iy  = int(floor(fy))
+  let sx  = fx - float32(ix)         # horizontal blend weight [0, 1)
+  let sy  = fy - float32(iy)         # vertical   blend weight [0, 1)
+  let x0  = ix       and (tex.w - 1)
+  let x1  = (ix + 1) and (tex.w - 1)
+  let y0  = iy       and (tex.h - 1)
+  let y1  = (iy + 1) and (tex.h - 1)
   let c00 = tex.pixels[y0 * tex.w + x0]
   let c10 = tex.pixels[y0 * tex.w + x1]
   let c01 = tex.pixels[y1 * tex.w + x0]
   let c11 = tex.pixels[y1 * tex.w + x1]
-  # Lerp each 8-bit channel independently then repack into ARGB.
-  proc ch(c: uint32; s: uint32): float32 {.inline.} = float32((c shr s) and 0xFF'u32)
-  proc blerp(s: uint32): uint32 {.inline.} =
-    let top = ch(c00, s) + (ch(c10, s) - ch(c00, s)) * sx
-    let bot = ch(c01, s) + (ch(c11, s) - ch(c01, s)) * sx
-    uint32(top + (bot - top) * sy) shl s
-  blerp(16'u32) or blerp(8'u32) or blerp(0'u32) or 0xFF000000'u32
+  # Bilinear weights for the four corners.
+  let w00 = (1.0'f32 - sx) * (1.0'f32 - sy)
+  let w10 = sx             * (1.0'f32 - sy)
+  let w01 = (1.0'f32 - sx) * sy
+  let w11 = sx             * sy
+  # Blend each 8-bit channel independently and repack into ARGB.
+  let r = uint32(float32((c00 shr 16) and 0xFF'u32) * w00 +
+                 float32((c10 shr 16) and 0xFF'u32) * w10 +
+                 float32((c01 shr 16) and 0xFF'u32) * w01 +
+                 float32((c11 shr 16) and 0xFF'u32) * w11)
+  let g = uint32(float32((c00 shr  8) and 0xFF'u32) * w00 +
+                 float32((c10 shr  8) and 0xFF'u32) * w10 +
+                 float32((c01 shr  8) and 0xFF'u32) * w01 +
+                 float32((c11 shr  8) and 0xFF'u32) * w11)
+  let b = uint32(float32( c00         and 0xFF'u32) * w00 +
+                 float32( c10         and 0xFF'u32) * w10 +
+                 float32( c01         and 0xFF'u32) * w01 +
+                 float32( c11         and 0xFF'u32) * w11)
+  0xFF000000'u32 or (r shl 16) or (g shl 8) or b
 
 proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
               s0, s1, s2: Vec3; uv0, uv1, uv2: Vec2;
