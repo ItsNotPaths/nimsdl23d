@@ -24,6 +24,7 @@ const
 type
   Tri = object
     v:       array[3, Vec3]
+    uv:      array[3, Vec2]
     r, g, b: uint8
 
   Cam = object
@@ -31,16 +32,46 @@ type
     yaw:   float32
     pitch: float32
 
+  Texture = object
+    pixels: seq[uint32]
+    w, h:   int
+
+  ClipVert = object
+    pos: Vec4
+    uv:  Vec2
+
+# ─── Texture loading ──────────────────────────────────────────────────────────
+
+proc loadTexture(path: string): Texture =
+  let surf = loadBMP(path)
+  assert surf != nil, "failed to load texture: " & path
+  let conv = surf.convertSurfaceFormat(SDL_PIXELFORMAT_ARGB8888, 0)
+  surf.freeSurface()
+  result.w = conv.w
+  result.h = conv.h
+  let nPix = result.w * result.h
+  result.pixels = newSeq[uint32](nPix)
+  copyMem(addr result.pixels[0], conv.pixels, nPix * 4)
+  conv.freeSurface()
+
 # ─── World loading ────────────────────────────────────────────────────────────
 
 proc loadWorld(path: string): seq[Tri] =
   for t in parseFile(path)["triangles"]:
     let v = t["v"]
     let c = t["color"]
+    var uv: array[3, Vec2]
+    if t.hasKey("uv"):
+      let ju = t["uv"]
+      for i in 0..2:
+        uv[i] = vec2(ju[i][0].getFloat.float32, ju[i][1].getFloat.float32)
+    else:
+      uv = [vec2(0'f32, 1'f32), vec2(1'f32, 1'f32), vec2(0.5'f32, 0'f32)]
     result.add Tri(
       v: [vec3(v[0][0].getFloat.float32, v[0][1].getFloat.float32, v[0][2].getFloat.float32),
           vec3(v[1][0].getFloat.float32, v[1][1].getFloat.float32, v[1][2].getFloat.float32),
           vec3(v[2][0].getFloat.float32, v[2][1].getFloat.float32, v[2][2].getFloat.float32)],
+      uv: uv,
       r: c[0].getInt.uint8,
       g: c[1].getInt.uint8,
       b: c[2].getInt.uint8)
@@ -64,15 +95,15 @@ proc toClip(v: Vec3; cam: Cam): Vec4 =
   let t   = v - cam.pos
   let vx  = dot(t, rgt)
   let vy  = dot(t, up)
-  let vz  = -dot(t, fwd)   # negative = in front
+  let vz  = -dot(t, fwd)
   vec4((FProj / Asp) * vx,
        FProj * vy,
        ProjA * vz + ProjB,
        -vz)
 
-proc clipPolygon(verts: seq[Vec4]): seq[Vec4] =
+proc clipPolygon(verts: seq[ClipVert]): seq[ClipVert] =
   # Sutherland-Hodgman against 6 homogeneous frustum planes.
-  # Signed distance > 0 means inside.
+  # UVs are interpolated alongside positions.
   proc sd(v: Vec4; plane: int): float32 =
     case plane
     of 0: v.w           # near:   w > 0
@@ -86,23 +117,25 @@ proc clipPolygon(verts: seq[Vec4]): seq[Vec4] =
   result = verts
   for plane in 0..5:
     if result.len == 0: return
-    var clipped: seq[Vec4]
+    var clipped: seq[ClipVert]
     let n = result.len
     for i in 0 ..< n:
       let a  = result[i]
       let b  = result[(i + 1) mod n]
-      let da = sd(a, plane)
-      let db = sd(b, plane)
+      let da = sd(a.pos, plane)
+      let db = sd(b.pos, plane)
       if da >= 0:
         if db >= 0:
           clipped.add b
         else:
           let t = da / (da - db)
-          clipped.add a + (b - a) * t
+          clipped.add ClipVert(pos: a.pos + (b.pos - a.pos) * t,
+                               uv:  a.uv  + (b.uv  - a.uv)  * t)
       else:
         if db >= 0:
           let t = da / (da - db)
-          clipped.add a + (b - a) * t
+          clipped.add ClipVert(pos: a.pos + (b.pos - a.pos) * t,
+                               uv:  a.uv  + (b.uv  - a.uv)  * t)
           clipped.add b
     result = clipped
 
@@ -118,8 +151,16 @@ proc clipToScreen(c: Vec4): Vec3 =
 proc edgeFn(a, b, p: Vec2): float32 =
   (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
 
+proc sampleTex(tex: Texture; u, v: float32): uint32 =
+  # Repeat wrap; works correctly for any float including negative values
+  # because bitwise-and on a signed int gives correct power-of-2 modulo.
+  let tx = int(u * float32(tex.w)) and (tex.w - 1)
+  let ty = int(v * float32(tex.h)) and (tex.h - 1)
+  tex.pixels[ty * tex.w + tx]
+
 proc drawTri(pixels: var seq[uint32]; zbuf: var seq[float32];
-             s0, s1, s2: Vec3; color: uint32) =
+             s0, s1, s2: Vec3; uv0, uv1, uv2: Vec2;
+             r, g, b: uint8; tex: Texture) =
   let a0   = vec2(s0.x, s0.y)
   let a1   = vec2(s1.x, s1.y)
   let a2   = vec2(s2.x, s2.y)
@@ -140,12 +181,22 @@ proc drawTri(pixels: var seq[uint32]; zbuf: var seq[float32];
       let inside = if area > 0: e0 >= 0 and e1 >= 0 and e2 >= 0
                    else:         e0 <= 0 and e1 <= 0 and e2 <= 0
       if inside:
-        # Perspective-correct depth: interpolate 1/w, keep largest (closest).
+        # 1/w interpolated across screen space — largest value = closest to cam.
         let z = (e0 * s0.z + e1 * s1.z + e2 * s2.z) / area
         let i = py * WinW + px
         if z > zbuf[i]:
-          zbuf[i]   = z
-          pixels[i] = color
+          zbuf[i] = z
+          # Perspective-correct UV: interpolate u/w and v/w, then divide by 1/w.
+          let uOverW = (e0 * uv0.x * s0.z + e1 * uv1.x * s1.z + e2 * uv2.x * s2.z) / area
+          let vOverW = (e0 * uv0.y * s0.z + e1 * uv1.y * s1.z + e2 * uv2.y * s2.z) / area
+          let tc  = sampleTex(tex, uOverW / z, vOverW / z)
+          let tr  = (tc shr 16) and 0xFF'u32
+          let tg  = (tc shr 8)  and 0xFF'u32
+          let tb  =  tc         and 0xFF'u32
+          pixels[i] = 0xFF000000'u32 or
+                      ((tr * uint32(r) div 255'u32) shl 16) or
+                      ((tg * uint32(g) div 255'u32) shl 8)  or
+                       (tb * uint32(b) div 255'u32)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -162,18 +213,19 @@ proc main() =
     Renderer_Accelerated or Renderer_PresentVsync)
   defer: ren.destroy()
 
-  let tex = ren.createTexture(
+  let rtTex = ren.createTexture(
     SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
     WinW.cint, WinH.cint)
-  defer: tex.destroy()
+  defer: rtTex.destroy()
 
   discard setRelativeMouseMode(True32)
 
-  let tris   = loadWorld("world/world.json")
-  var pixels = newSeq[uint32](WinW * WinH)
-  var zbuf   = newSeq[float32](WinW * WinH)
-  var cam    = Cam(pos: vec3(0'f32, 20'f32, 30'f32))
-  var last   = getTicks()
+  let tris    = loadWorld("world/world.json")
+  let diffuse = loadTexture("assets/Michigan_06_256x256.bmp")
+  var pixels  = newSeq[uint32](WinW * WinH)
+  var zbuf    = newSeq[float32](WinW * WinH)
+  var cam     = Cam(pos: vec3(0'f32, 20'f32, 30'f32))
+  var last    = getTicks()
 
   while true:
     let now = getTicks()
@@ -207,23 +259,23 @@ proc main() =
       zbuf[i]   = 0'f32
 
     for t in tris:
-      var poly = @[toClip(t.v[0], cam),
-                   toClip(t.v[1], cam),
-                   toClip(t.v[2], cam)]
+      var poly = @[
+        ClipVert(pos: toClip(t.v[0], cam), uv: t.uv[0]),
+        ClipVert(pos: toClip(t.v[1], cam), uv: t.uv[1]),
+        ClipVert(pos: toClip(t.v[2], cam), uv: t.uv[2])]
       poly = clipPolygon(poly)
       if poly.len < 3: continue
-      let col = 0xFF000000'u32 or
-                (t.r.uint32 shl 16) or
-                (t.g.uint32 shl 8)  or
-                t.b.uint32
-      var screens: seq[Vec3]
+      var ss: seq[tuple[s: Vec3, uv: Vec2]]
       for cv in poly:
-        screens.add clipToScreen(cv)
-      for i in 1 .. screens.len - 2:
-        drawTri(pixels, zbuf, screens[0], screens[i], screens[i+1], col)
+        ss.add (clipToScreen(cv.pos), cv.uv)
+      for i in 1 .. ss.len - 2:
+        drawTri(pixels, zbuf,
+                ss[0].s, ss[i].s, ss[i+1].s,
+                ss[0].uv, ss[i].uv, ss[i+1].uv,
+                t.r, t.g, t.b, diffuse)
 
-    discard tex.updateTexture(nil, addr pixels[0], cint(WinW * 4))
-    discard ren.copy(tex, nil, nil)
+    discard rtTex.updateTexture(nil, addr pixels[0], cint(WinW * 4))
+    discard ren.copy(rtTex, nil, nil)
     ren.present()
 
 main()
