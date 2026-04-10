@@ -270,3 +270,34 @@ proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
 proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
               t: Tri; cam: Cam; filter = Bilinear) {.inline.} =
   drawTri(pixels, zbuf, t, cam, camBasis(cam), filter)
+
+# ─── Sprite billboard ─────────────────────────────────────────────────────────
+
+proc drawSprite*(pixels: var seq[uint32]; zbuf: var seq[float32];
+                 pos: Vec3; w, h: float32; tex: var Texture;
+                 cam: Cam; basis: CamBasis;
+                 r, g, b: uint8 = 255; filter = Bilinear) =
+  ## Draw a textured billboard at world position `pos` (center-bottom origin).
+  ## The sprite is `w` units wide and `h` units tall.  It always faces the
+  ## camera and stands upright along world Y regardless of camera pitch.
+  let rgt = basis.rgt
+  let up  = vec3(0'f32, 1'f32, 0'f32)
+  let hw  = w * 0.5'f32
+  let bl  = pos           - rgt * hw        # bottom-left  uv (0,1)
+  let br  = pos           + rgt * hw        # bottom-right uv (1,1)
+  let tl  = pos + up * h - rgt * hw        # top-left     uv (0,0)
+  let tr  = pos + up * h + rgt * hw        # top-right    uv (1,0)
+  var t1 = Tri(v:  [bl, br, tr],
+               uv: [vec2(0,1), vec2(1,1), vec2(1,0)],
+               r: r, g: g, b: b, tex: addr tex)
+  var t2 = Tri(v:  [bl, tr, tl],
+               uv: [vec2(0,1), vec2(1,0), vec2(0,0)],
+               r: r, g: g, b: b, tex: addr tex)
+  drawTri(pixels, zbuf, t1, cam, basis, filter)
+  drawTri(pixels, zbuf, t2, cam, basis, filter)
+
+proc drawSprite*(pixels: var seq[uint32]; zbuf: var seq[float32];
+                 pos: Vec3; w, h: float32; tex: var Texture;
+                 cam: Cam; r, g, b: uint8 = 255;
+                 filter = Bilinear) {.inline.} =
+  drawSprite(pixels, zbuf, pos, w, h, tex, cam, camBasis(cam), r, g, b, filter)
