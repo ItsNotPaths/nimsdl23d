@@ -198,6 +198,60 @@ proc drawTri(pixels: var seq[uint32]; zbuf: var seq[float32];
                       ((tg * uint32(g) div 255'u32) shl 8)  or
                        (tb * uint32(b) div 255'u32)
 
+# ─── Bitmap font (5×7, 2× scale) ─────────────────────────────────────────────
+
+const
+  CharW  = 5
+  CharH  = 7
+  CharSc = 2  # pixel scale multiplier
+
+# Indexed as: '0'-'9' → 0-9, 'F' → 10, 'P' → 11, 'S' → 12, ':' → 13, else → 14 (space)
+# Each entry is 7 rows; each row is 5 bits, bit-4 = leftmost pixel.
+const fontData: array[15, array[7, uint8]] = [
+  [14'u8, 17, 17, 17, 17, 17, 14],  # 0  .###. #...# #...# #...# #...# #...# .###.
+  [ 4'u8, 12,  4,  4,  4,  4, 14],  # 1  ..#.. .##.. ..#.. ..#.. ..#.. ..#.. .###.
+  [14'u8, 17,  1,  6, 12, 16, 31],  # 2  .###. #...# ....# ..##. .##.. #.... #####
+  [14'u8, 17,  1,  6,  1, 17, 14],  # 3  .###. #...# ....# ..##. ....# #...# .###.
+  [ 6'u8, 10, 18, 31,  2,  2,  2],  # 4  ..##. .#.#. #..#. ##### ...#. ...#. ...#.
+  [31'u8, 16, 30,  1,  1, 17, 14],  # 5  ##### #.... ####. ....# ....# #...# .###.
+  [ 6'u8,  8, 16, 30, 17, 17, 14],  # 6  ..##. .#... #.... ####. #...# #...# .###.
+  [31'u8,  1,  2,  4,  8,  8,  8],  # 7  ##### ....# ...#. ..#.. .#... .#... .#...
+  [14'u8, 17, 17, 14, 17, 17, 14],  # 8  .###. #...# #...# .###. #...# #...# .###.
+  [14'u8, 17, 17, 15,  1,  1, 14],  # 9  .###. #...# #...# .#### ....# ....# .###.
+  [31'u8, 16, 16, 30, 16, 16, 16],  # F  ##### #.... #.... ####. #.... #.... #....
+  [30'u8, 17, 17, 30, 16, 16, 16],  # P  ####. #...# #...# ####. #.... #.... #....
+  [15'u8, 16, 16, 14,  1,  1, 30],  # S  .#### #.... #.... .###. ....# ....# ####.
+  [ 0'u8, 12, 12,  0, 12, 12,  0],  # :  ..... .##.. .##.. ..... .##.. .##.. .....
+  [ 0'u8,  0,  0,  0,  0,  0,  0],  # (space)
+]
+
+proc charIdx(c: char): int =
+  case c
+  of '0'..'9': ord(c) - ord('0')
+  of 'F': 10
+  of 'P': 11
+  of 'S': 12
+  of ':': 13
+  else:   14
+
+proc drawChar(pixels: var seq[uint32]; x, y: int; c: char; color: uint32) =
+  let d = fontData[charIdx(c)]
+  for row in 0 ..< CharH:
+    for col in 0 ..< CharW:
+      if (d[row] and (0b10000'u8 shr col)) != 0:
+        for sy in 0 ..< CharSc:
+          for sx in 0 ..< CharSc:
+            let px = x + col * CharSc + sx
+            let py = y + row * CharSc + sy
+            if px in 0 ..< WinW and py in 0 ..< WinH:
+              pixels[py * WinW + px] = color
+
+proc drawText(pixels: var seq[uint32]; x, y: int; text: string; color: uint32) =
+  var cx = x
+  for c in text:
+    drawChar(pixels, cx, y, c, color)
+    cx += (CharW + 1) * CharSc
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 proc main() =
@@ -224,8 +278,11 @@ proc main() =
   let diffuse = loadTexture("assets/Michigan_06_256x256.bmp")
   var pixels  = newSeq[uint32](WinW * WinH)
   var zbuf    = newSeq[float32](WinW * WinH)
-  var cam     = Cam(pos: vec3(0'f32, 20'f32, 30'f32))
-  var last    = getTicks()
+  var cam        = Cam(pos: vec3(0'f32, 20'f32, 30'f32))
+  var last       = getTicks()
+  var fpsCount   = 0
+  var fpsTimer   = 0.0'f32
+  var fpsDisplay = 0
 
   while true:
     let now = getTicks()
@@ -273,6 +330,16 @@ proc main() =
                 ss[0].s, ss[i].s, ss[i+1].s,
                 ss[0].uv, ss[i].uv, ss[i+1].uv,
                 t.r, t.g, t.b, diffuse)
+
+    inc fpsCount
+    fpsTimer += dt
+    if fpsTimer >= 0.5'f32:
+      fpsDisplay = int(float32(fpsCount) / fpsTimer + 0.5'f32)
+      fpsCount = 0
+      fpsTimer = 0.0'f32
+    let fpsStr = "FPS: " & $fpsDisplay
+    let textW  = fpsStr.len * (CharW + 1) * CharSc
+    drawText(pixels, WinW - textW - 4, 4, fpsStr, 0xFF_FFFF00'u32)
 
     discard rtTex.updateTexture(nil, addr pixels[0], cint(WinW * 4))
     discard ren.copy(rtTex, nil, nil)
