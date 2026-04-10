@@ -10,8 +10,9 @@ const
   FovDeg    = 70.0'f32
   Near      = 0.1'f32
   Far       = 500.0'f32
-  MoveSpeed = 12.0'f32
-  MouseSens = 0.002'f32
+  MoveSpeed  = 12.0'f32
+  MouseSens  = 0.002'f32
+  ShowFps    = true
 
 const
   FProj = 1.0'f32 / tan(FovDeg * PI.float32 / 180.0'f32 / 2.0'f32)
@@ -337,9 +338,10 @@ proc main() =
       fpsDisplay = int(float32(fpsCount) / fpsTimer + 0.5'f32)
       fpsCount = 0
       fpsTimer = 0.0'f32
-    let fpsStr = "FPS: " & $fpsDisplay
-    let textW  = fpsStr.len * (CharW + 1) * CharSc
-    drawText(pixels, WinW - textW - 4, 4, fpsStr, 0xFF_FFFF00'u32)
+    when ShowFps:
+      let fpsStr = "FPS: " & $fpsDisplay
+      let textW  = fpsStr.len * (CharW + 1) * CharSc
+      drawText(pixels, WinW - textW - 4, 4, fpsStr, 0xFF_FFFF00'u32)
 
     discard rtTex.updateTexture(nil, addr pixels[0], cint(WinW * 4))
     discard ren.copy(rtTex, nil, nil)
