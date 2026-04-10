@@ -3,3 +3,4 @@ nimcache/
 *.exe
 renderer
 fps_counter.md
+assets/
