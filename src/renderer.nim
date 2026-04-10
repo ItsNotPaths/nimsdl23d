@@ -24,9 +24,10 @@ const
 
 type
   Tri* = object
-    v*:       array[3, Vec3]
-    uv*:      array[3, Vec2]
+    v*:         array[3, Vec3]
+    uv*:        array[3, Vec2]
     r*, g*, b*: uint8
+    tex*:       ptr Texture
 
   Cam* = object
     pos*:   Vec3
@@ -57,28 +58,36 @@ proc loadTexture*(path: string): Texture =
 
 # ─── Camera ───────────────────────────────────────────────────────────────────
 
-proc camFwd*(c: Cam): Vec3 =
+proc camFwd*(c: Cam): Vec3 {.inline.} =
   vec3(cos(c.pitch) * sin(c.yaw),
        sin(c.pitch),
        -cos(c.pitch) * cos(c.yaw))
 
-proc camRgt*(c: Cam): Vec3 =
+proc camRgt*(c: Cam): Vec3 {.inline.} =
   vec3(cos(c.yaw), 0'f32, sin(c.yaw))
+
+type CamBasis* = object
+  fwd*, rgt*, up*: Vec3
+
+proc camBasis*(c: Cam): CamBasis {.inline.} =
+  let fwd = camFwd(c)
+  let rgt = camRgt(c)
+  CamBasis(fwd: fwd, rgt: rgt, up: cross(rgt, fwd))
 
 # ─── Projection ───────────────────────────────────────────────────────────────
 
-proc toClip*(v: Vec3; cam: Cam): Vec4 =
-  let fwd = camFwd(cam)
-  let rgt = camRgt(cam)
-  let up  = cross(rgt, fwd)
-  let t   = v - cam.pos
-  let vx  = dot(t, rgt)
-  let vy  = dot(t, up)
-  let vz  = -dot(t, fwd)
+proc toClip*(v: Vec3; cam: Cam; basis: CamBasis): Vec4 {.inline.} =
+  let t  = v - cam.pos
+  let vx = dot(t, basis.rgt)
+  let vy = dot(t, basis.up)
+  let vz = -dot(t, basis.fwd)
   vec4((FProj / Asp) * vx,
        FProj * vy,
        ProjA * vz + ProjB,
        -vz)
+
+proc toClip*(v: Vec3; cam: Cam): Vec4 {.inline.} =
+  toClip(v, cam, camBasis(cam))
 
 proc clipPolygon*(verts: seq[ClipVert]): seq[ClipVert] =
   # Sutherland-Hodgman against 6 homogeneous frustum planes.
@@ -144,38 +153,84 @@ proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
   let a1   = vec2(s1.x, s1.y)
   let a2   = vec2(s2.x, s2.y)
   let area = edgeFn(a0, a1, a2)
-  if abs(area) < 0.5'f32: return
+  # Back-face cull: area >= 0 means tri faces away (CCW winding expected).
+  # Degenerate triangles (area ≈ 0) are also skipped.
+  if area >= -0.5'f32: return
 
   let x0 = max(0,       int(min(s0.x, min(s1.x, s2.x))))
   let x1 = min(WinW-1,  int(max(s0.x, max(s1.x, s2.x))) + 1)
   let y0 = max(0,       int(min(s0.y, min(s1.y, s2.y))))
   let y1 = min(WinH-1,  int(max(s0.y, max(s1.y, s2.y))) + 1)
 
+  # Incremental edge + attribute steps — avoids per-pixel multiplications.
+  # Δe per pixel right: -(b.y - a.y); per row down: (b.x - a.x)
+  let dE0dx = a1.y - a2.y;  let dE0dy = a2.x - a1.x
+  let dE1dx = a2.y - a0.y;  let dE1dy = a0.x - a2.x
+  let dE2dx = a0.y - a1.y;  let dE2dy = a1.x - a0.x
+
+  let invArea = 1.0'f32 / area
+  # Precomputed attribute steps (z = 1/w, u = u/w, v = v/w in screen space)
+  let dZdx = (dE0dx * s0.z  + dE1dx * s1.z  + dE2dx * s2.z)         * invArea
+  let dZdy = (dE0dy * s0.z  + dE1dy * s1.z  + dE2dy * s2.z)         * invArea
+  let dUdx = (dE0dx * uv0.x * s0.z + dE1dx * uv1.x * s1.z + dE2dx * uv2.x * s2.z) * invArea
+  let dUdy = (dE0dy * uv0.x * s0.z + dE1dy * uv1.x * s1.z + dE2dy * uv2.x * s2.z) * invArea
+  let dVdx = (dE0dx * uv0.y * s0.z + dE1dx * uv1.y * s1.z + dE2dx * uv2.y * s2.z) * invArea
+  let dVdy = (dE0dy * uv0.y * s0.z + dE1dy * uv1.y * s1.z + dE2dy * uv2.y * s2.z) * invArea
+
+  # Seed at top-left corner of bounding box
+  let p0    = vec2(float32(x0) + 0.5'f32, float32(y0) + 0.5'f32)
+  var rowE0 = edgeFn(a1, a2, p0)
+  var rowE1 = edgeFn(a2, a0, p0)
+  var rowE2 = edgeFn(a0, a1, p0)
+  var rowZ  = (rowE0 * s0.z  + rowE1 * s1.z  + rowE2 * s2.z)         * invArea
+  var rowU  = (rowE0 * uv0.x * s0.z + rowE1 * uv1.x * s1.z + rowE2 * uv2.x * s2.z) * invArea
+  var rowV  = (rowE0 * uv0.y * s0.z + rowE1 * uv1.y * s1.z + rowE2 * uv2.y * s2.z) * invArea
+
   for py in y0..y1:
+    var e0 = rowE0; var e1 = rowE1; var e2 = rowE2
+    var z = rowZ;   var u = rowU;   var v = rowV
+    let rowBase = py * WinW
     for px in x0..x1:
-      let p  = vec2(float32(px) + 0.5'f32, float32(py) + 0.5'f32)
-      let e0 = edgeFn(a1, a2, p)
-      let e1 = edgeFn(a2, a0, p)
-      let e2 = edgeFn(a0, a1, p)
-      let inside = if area > 0: e0 >= 0 and e1 >= 0 and e2 >= 0
-                   else:         e0 <= 0 and e1 <= 0 and e2 <= 0
-      if inside:
-        # 1/w interpolated across screen space — largest value = closest to cam.
-        let z = (e0 * s0.z + e1 * s1.z + e2 * s2.z) / area
-        let i = py * WinW + px
+      if e0 <= 0 and e1 <= 0 and e2 <= 0:  # all ≤ 0 = inside (CCW)
+        let i = rowBase + px
         if z > zbuf[i]:
           zbuf[i] = z
-          # Perspective-correct UV: interpolate u/w and v/w, then divide by 1/w.
-          let uOverW = (e0 * uv0.x * s0.z + e1 * uv1.x * s1.z + e2 * uv2.x * s2.z) / area
-          let vOverW = (e0 * uv0.y * s0.z + e1 * uv1.y * s1.z + e2 * uv2.y * s2.z) / area
-          let tc  = sampleTex(tex, uOverW / z, vOverW / z)
-          let tr  = (tc shr 16) and 0xFF'u32
-          let tg  = (tc shr 8)  and 0xFF'u32
-          let tb  =  tc         and 0xFF'u32
+          let tc = sampleTex(tex, u / z, v / z)
+          let tr = (tc shr 16) and 0xFF'u32
+          let tg = (tc shr 8)  and 0xFF'u32
+          let tb =  tc         and 0xFF'u32
           pixels[i] = 0xFF000000'u32 or
                       ((tr * uint32(r) div 255'u32) shl 16) or
                       ((tg * uint32(g) div 255'u32) shl 8)  or
                        (tb * uint32(b) div 255'u32)
+      e0 += dE0dx; e1 += dE1dx; e2 += dE2dx
+      z  += dZdx;  u  += dUdx;  v  += dVdx
+    rowE0 += dE0dy; rowE1 += dE1dy; rowE2 += dE2dy
+    rowZ  += dZdy;  rowU  += dUdy;  rowV  += dVdy
+
+# ─── High-level draw — clips and rasterises a Tri using its own texture ───────
+
+proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
+              t: Tri; cam: Cam; basis: CamBasis) =
+  assert t.tex != nil, "Tri.tex must be set before drawing"
+  var poly = @[
+    ClipVert(pos: toClip(t.v[0], cam, basis), uv: t.uv[0]),
+    ClipVert(pos: toClip(t.v[1], cam, basis), uv: t.uv[1]),
+    ClipVert(pos: toClip(t.v[2], cam, basis), uv: t.uv[2])]
+  poly = clipPolygon(poly)
+  if poly.len < 3: return
+  var ss: seq[tuple[s: Vec3, uv: Vec2]]
+  for cv in poly:
+    ss.add (clipToScreen(cv.pos), cv.uv)
+  for i in 1 .. ss.len - 2:
+    drawTri(pixels, zbuf,
+            ss[0].s, ss[i].s, ss[i+1].s,
+            ss[0].uv, ss[i].uv, ss[i+1].uv,
+            t.r, t.g, t.b, t.tex[])
+
+proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
+              t: Tri; cam: Cam) {.inline.} =
+  drawTri(pixels, zbuf, t, cam, camBasis(cam))
 
 # ─── Bitmap font (5×7, 2× scale) ─────────────────────────────────────────────
 
