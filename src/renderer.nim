@@ -40,6 +40,10 @@ type
     pos*: Vec4
     uv*:  Vec2
 
+  TexFilter* = enum
+    Nearest   ## Hard pixel — fast, retro look
+    Bilinear  ## 4-sample blend — smooth gradients
+
 # ─── Texture loading ──────────────────────────────────────────────────────────
 
 proc loadTexture*(path: string): Texture =
@@ -138,15 +142,39 @@ proc edgeFn*(a, b, p: Vec2): float32 =
   (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
 
 proc sampleTex*(tex: Texture; u, v: float32): uint32 =
-  # Repeat wrap; works correctly for any float including negative values
-  # because bitwise-and on a signed int gives correct power-of-2 modulo.
+  # Nearest-neighbour. Repeat wrap via power-of-2 bitwise-and.
   let tx = int(u * float32(tex.w)) and (tex.w - 1)
   let ty = int(v * float32(tex.h)) and (tex.h - 1)
   tex.pixels[ty * tex.w + tx]
 
+proc sampleTexBilinear*(tex: Texture; u, v: float32): uint32 =
+  # Bilinear filter with power-of-2 repeat wrap.
+  # Offset by 0.5 so the sample point aligns with the texel centre.
+  let fx = u * float32(tex.w) - 0.5'f32
+  let fy = v * float32(tex.h) - 0.5'f32
+  let ix = int(floor(fx))
+  let iy = int(floor(fy))
+  let sx = fx - float32(ix)   # horizontal blend weight [0, 1)
+  let sy = fy - float32(iy)   # vertical   blend weight [0, 1)
+  let x0 = ix       and (tex.w - 1)
+  let x1 = (ix + 1) and (tex.w - 1)
+  let y0 = iy       and (tex.h - 1)
+  let y1 = (iy + 1) and (tex.h - 1)
+  let c00 = tex.pixels[y0 * tex.w + x0]
+  let c10 = tex.pixels[y0 * tex.w + x1]
+  let c01 = tex.pixels[y1 * tex.w + x0]
+  let c11 = tex.pixels[y1 * tex.w + x1]
+  # Lerp each 8-bit channel independently then repack into ARGB.
+  proc ch(c: uint32; s: uint32): float32 {.inline.} = float32((c shr s) and 0xFF'u32)
+  proc blerp(s: uint32): uint32 {.inline.} =
+    let top = ch(c00, s) + (ch(c10, s) - ch(c00, s)) * sx
+    let bot = ch(c01, s) + (ch(c11, s) - ch(c01, s)) * sx
+    uint32(top + (bot - top) * sy) shl s
+  blerp(16'u32) or blerp(8'u32) or blerp(0'u32) or 0xFF000000'u32
+
 proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
               s0, s1, s2: Vec3; uv0, uv1, uv2: Vec2;
-              r, g, b: uint8; tex: Texture) =
+              r, g, b: uint8; tex: Texture; filter = Bilinear) =
   let a0   = vec2(s0.x, s0.y)
   let a1   = vec2(s1.x, s1.y)
   let a2   = vec2(s2.x, s2.y)
@@ -193,7 +221,8 @@ proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
         let i = rowBase + px
         if z > zbuf[i]:
           zbuf[i] = z
-          let tc = sampleTex(tex, u / z, v / z)
+          let tc = if filter == Bilinear: sampleTexBilinear(tex, u / z, v / z)
+                   else:                 sampleTex(tex, u / z, v / z)
           let tr = (tc shr 16) and 0xFF'u32
           let tg = (tc shr 8)  and 0xFF'u32
           let tb =  tc         and 0xFF'u32
@@ -209,7 +238,7 @@ proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
 # ─── High-level draw — clips and rasterises a Tri using its own texture ───────
 
 proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
-              t: Tri; cam: Cam; basis: CamBasis) =
+              t: Tri; cam: Cam; basis: CamBasis; filter = Bilinear) =
   assert t.tex != nil, "Tri.tex must be set before drawing"
   var poly = @[
     ClipVert(pos: toClip(t.v[0], cam, basis), uv: t.uv[0]),
@@ -224,8 +253,8 @@ proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
     drawTri(pixels, zbuf,
             ss[0].s, ss[i].s, ss[i+1].s,
             ss[0].uv, ss[i].uv, ss[i+1].uv,
-            t.r, t.g, t.b, t.tex[])
+            t.r, t.g, t.b, t.tex[], filter)
 
 proc drawTri*(pixels: var seq[uint32]; zbuf: var seq[float32];
-              t: Tri; cam: Cam) {.inline.} =
-  drawTri(pixels, zbuf, t, cam, camBasis(cam))
+              t: Tri; cam: Cam; filter = Bilinear) {.inline.} =
+  drawTri(pixels, zbuf, t, cam, camBasis(cam), filter)
