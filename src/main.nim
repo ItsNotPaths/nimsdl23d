@@ -10,12 +10,14 @@ const
   FovDeg    = 70.0'f32
   Near      = 0.1'f32
   Far       = 500.0'f32
-  MoveSpeed = 5.0'f32
+  MoveSpeed = 12.0'f32
   MouseSens = 0.002'f32
 
 const
   FProj = 1.0'f32 / tan(FovDeg * PI.float32 / 180.0'f32 / 2.0'f32)
   Asp   = WinW.float32 / WinH.float32
+  ProjA = -(Far + Near) / (Far - Near)
+  ProjB = -2.0'f32 * Near * Far / (Far - Near)
 
 # ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,7 +33,7 @@ type
 
 # ─── World loading ────────────────────────────────────────────────────────────
 
-proc loadTris(path: string): seq[Tri] =
+proc loadWorld(path: string): seq[Tri] =
   for t in parseFile(path)["triangles"]:
     let v = t["v"]
     let c = t["color"]
@@ -55,9 +57,7 @@ proc camRgt(c: Cam): Vec3 =
 
 # ─── Projection ───────────────────────────────────────────────────────────────
 
-# Returns screen-space (px, py, 1/w).
-# 1/w is perspective-correct depth: larger = closer. Negative signals clipped.
-proc projectVert(v: Vec3; cam: Cam): Vec3 =
+proc toClip(v: Vec3; cam: Cam): Vec4 =
   let fwd = camFwd(cam)
   let rgt = camRgt(cam)
   let up  = cross(rgt, fwd)
@@ -65,17 +65,53 @@ proc projectVert(v: Vec3; cam: Cam): Vec3 =
   let vx  = dot(t, rgt)
   let vy  = dot(t, up)
   let vz  = -dot(t, fwd)   # negative = in front
+  vec4((FProj / Asp) * vx,
+       FProj * vy,
+       ProjA * vz + ProjB,
+       -vz)
 
-  if vz >= -Near: return vec3(0, 0, -1)
+proc clipPolygon(verts: seq[Vec4]): seq[Vec4] =
+  # Sutherland-Hodgman against 6 homogeneous frustum planes.
+  # Signed distance > 0 means inside.
+  proc sd(v: Vec4; plane: int): float32 =
+    case plane
+    of 0: v.w           # near:   w > 0
+    of 1: v.w - v.z     # far:    z < w
+    of 2: v.x + v.w     # left:   x > -w
+    of 3: v.w - v.x     # right:  x < w
+    of 4: v.y + v.w     # bottom: y > -w
+    of 5: v.w - v.y     # top:    y < w
+    else: 0'f32
 
-  let cw = -vz
-  let nx = (FProj / Asp) * vx / cw
-  let ny = FProj * vy / cw
+  result = verts
+  for plane in 0..5:
+    if result.len == 0: return
+    var clipped: seq[Vec4]
+    let n = result.len
+    for i in 0 ..< n:
+      let a  = result[i]
+      let b  = result[(i + 1) mod n]
+      let da = sd(a, plane)
+      let db = sd(b, plane)
+      if da >= 0:
+        if db >= 0:
+          clipped.add b
+        else:
+          let t = da / (da - db)
+          clipped.add a + (b - a) * t
+      else:
+        if db >= 0:
+          let t = da / (da - db)
+          clipped.add a + (b - a) * t
+          clipped.add b
+    result = clipped
 
-  const Guard = 4096.0'f32
-  vec3(clamp((nx + 1'f32) * 0.5'f32 * WinW.float32, -Guard, WinW.float32 + Guard),
-       clamp((1'f32 - ny)  * 0.5'f32 * WinH.float32, -Guard, WinH.float32 + Guard),
-       1.0'f32 / cw)
+proc clipToScreen(c: Vec4): Vec3 =
+  let nx = c.x / c.w
+  let ny = c.y / c.w
+  vec3((nx + 1'f32) * 0.5'f32 * WinW.float32,
+       (1'f32 - ny) * 0.5'f32 * WinH.float32,
+       1.0'f32 / c.w)
 
 # ─── Rasterizer ───────────────────────────────────────────────────────────────
 
@@ -133,10 +169,10 @@ proc main() =
 
   discard setRelativeMouseMode(True32)
 
-  let tris   = loadTris("world/world.json")
+  let tris   = loadWorld("world/world.json")
   var pixels = newSeq[uint32](WinW * WinH)
   var zbuf   = newSeq[float32](WinW * WinH)
-  var cam    = Cam(pos: vec3(0'f32, 2'f32, 8'f32))
+  var cam    = Cam(pos: vec3(0'f32, 20'f32, 30'f32))
   var last   = getTicks()
 
   while true:
@@ -171,15 +207,20 @@ proc main() =
       zbuf[i]   = 0'f32
 
     for t in tris:
-      let s0 = projectVert(t.v[0], cam)
-      let s1 = projectVert(t.v[1], cam)
-      let s2 = projectVert(t.v[2], cam)
-      if s0.z < 0 or s1.z < 0 or s2.z < 0: continue
+      var poly = @[toClip(t.v[0], cam),
+                   toClip(t.v[1], cam),
+                   toClip(t.v[2], cam)]
+      poly = clipPolygon(poly)
+      if poly.len < 3: continue
       let col = 0xFF000000'u32 or
                 (t.r.uint32 shl 16) or
                 (t.g.uint32 shl 8)  or
                 t.b.uint32
-      drawTri(pixels, zbuf, s0, s1, s2, col)
+      var screens: seq[Vec3]
+      for cv in poly:
+        screens.add clipToScreen(cv)
+      for i in 1 .. screens.len - 2:
+        drawTri(pixels, zbuf, screens[0], screens[i], screens[i+1], col)
 
     discard tex.updateTexture(nil, addr pixels[0], cint(WinW * 4))
     discard ren.copy(tex, nil, nil)
