@@ -2,3 +2,4 @@ vendor/
 nimcache/
 *.exe
 renderer
+fps_counter.md
